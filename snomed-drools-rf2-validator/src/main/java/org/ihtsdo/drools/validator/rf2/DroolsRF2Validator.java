@@ -16,6 +16,7 @@ import org.ihtsdo.otf.resourcemanager.ResourceManager;
 import org.ihtsdo.otf.snomedboot.ReleaseImportException;
 import org.ihtsdo.otf.snomedboot.ReleaseImporter;
 import org.ihtsdo.otf.snomedboot.domain.Concept;
+import org.ihtsdo.otf.snomedboot.factory.ComponentFactory;
 import org.ihtsdo.otf.snomedboot.factory.LoadingProfile;
 import org.ihtsdo.otf.snomedboot.factory.implementation.standard.ComponentStore;
 import org.slf4j.Logger;
@@ -49,6 +50,29 @@ public class DroolsRF2Validator {
 			.withIncludedReferenceSetFilenamePattern(".*_sRefset_.*OWL.*")
 			.withIncludedReferenceSetFilenamePattern(".*_scsRefset_.*ComponentAnnotation.*")
 			.withEffectiveComponentFilter();
+	private static final LoadingProfile SINGLE_SNAPSHOT_LOADING_PROFILE =
+			LOADING_PROFILE.withoutEffectiveComponentFilter();
+
+	/**
+	 * Escape hatch for loading the RF2 files one at a time, as this did before
+	 * {@link SnomedDroolsComponentRepository} was made safe for concurrent writes.
+	 * Set to {@code false} only to rule the loader out while diagnosing something.
+	 */
+	public static final String PARALLEL_LOADING_PROPERTY = "snomed.drools.parallelLoading";
+
+	/**
+	 * Whether the RF2 files may be read concurrently.
+	 *
+	 * <p>{@code ReleaseImporter} loads the concept file inline first, then the core
+	 * component files as one concurrent phase, then the reference set files as
+	 * another. Those barriers are what make this safe: descriptions can resolve
+	 * their concept, and language reference set members can resolve their
+	 * description, because the phase they depend on has completed. Writes within a
+	 * phase are guarded by {@link SnomedDroolsComponentRepository}.
+	 */
+	private static boolean parallelLoading() {
+		return !"false".equalsIgnoreCase(System.getProperty(PARALLEL_LOADING_PROPERTY));
+	}
 
 	private final RuleExecutor ruleExecutor;
 	private final TestResourceProvider testResourceProvider;
@@ -248,8 +272,22 @@ public class DroolsRF2Validator {
 	private PreviousReleaseComponentFactory loadPreviousReleaseComponentIds(Set<String> previousReleaseDirectories) throws ReleaseImportException {
 		ReleaseImporter importer = new ReleaseImporter();
 		final PreviousReleaseComponentFactory componentFactory = new PreviousReleaseComponentFactory();
-		importer.loadEffectiveSnapshotReleaseFiles(previousReleaseDirectories, LOADING_PROFILE, componentFactory, true);
+		loadSnapshotReleaseFiles(importer, previousReleaseDirectories, componentFactory, true,
+				RF2ReleaseFilesUtil.isSingleSnapshotRelease(previousReleaseDirectories));
 		return componentFactory;
+	}
+
+	private static void loadSnapshotReleaseFiles(ReleaseImporter releaseImporter,
+			Set<String> extractedRF2FilesDirectories, ComponentFactory componentFactory,
+			boolean multiThreaded, boolean singleSnapshotRelease) throws ReleaseImportException {
+		if (singleSnapshotRelease) {
+			logger.info("Single Snapshot release detected; skipping effective component filtering pre-pass.");
+			releaseImporter.loadSnapshotReleaseFiles(extractedRF2FilesDirectories.iterator().next(),
+					SINGLE_SNAPSHOT_LOADING_PROFILE, componentFactory, multiThreaded);
+		} else {
+			releaseImporter.loadEffectiveSnapshotReleaseFiles(extractedRF2FilesDirectories,
+					LOADING_PROFILE, componentFactory, multiThreaded);
+		}
 	}
 
 	private SnomedDroolsComponentRepository loadComponentsFromRF2(Set<String> extractedRF2FilesDirectories, String currentEffectiveTime,
@@ -257,7 +295,9 @@ public class DroolsRF2Validator {
 
 		ReleaseImporter releaseImporter = new ReleaseImporter();
 
-		boolean loadDelta = RF2ReleaseFilesUtil.anyDeltaFilesPresent(extractedRF2FilesDirectories);
+		boolean singleSnapshotRelease = RF2ReleaseFilesUtil.isSingleSnapshotRelease(extractedRF2FilesDirectories);
+		boolean loadDelta = !singleSnapshotRelease
+				&& RF2ReleaseFilesUtil.anyDeltaFilesPresent(extractedRF2FilesDirectories);
 		if (loadDelta) {
 			logger.info("Delta files detected, validating combination of snapshot and delta.");
 		} else {
@@ -267,10 +307,11 @@ public class DroolsRF2Validator {
 		SnomedDroolsComponentRepository repository = new SnomedDroolsComponentRepository();
 		SnomedDroolsComponentFactory componentFactory = new SnomedDroolsComponentFactory(new ComponentStore(), repository, currentEffectiveTime, previousReleaseComponentIds);
 
+		boolean multiThreaded = parallelLoading();
 		if (loadDelta) {
-			releaseImporter.loadEffectiveSnapshotAndDeltaReleaseFiles(extractedRF2FilesDirectories, LOADING_PROFILE, componentFactory, false);
+			releaseImporter.loadEffectiveSnapshotAndDeltaReleaseFiles(extractedRF2FilesDirectories, LOADING_PROFILE, componentFactory, multiThreaded);
 		} else {
-			releaseImporter.loadEffectiveSnapshotReleaseFiles(extractedRF2FilesDirectories, LOADING_PROFILE, componentFactory, false);
+			releaseImporter.loadEffectiveSnapshotReleaseFiles(extractedRF2FilesDirectories, LOADING_PROFILE, componentFactory, multiThreaded);
 		}
 
 		final Map<Long, ? extends Concept> conceptMap = componentFactory.getComponentStore().getConcepts();
